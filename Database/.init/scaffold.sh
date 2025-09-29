@@ -2,52 +2,71 @@
 set -euo pipefail
 WORKSPACE="/home/kavia/workspace/code-generation/recipe-finding-app-98606-98494/Database"
 cd "$WORKSPACE"
-LOG="$WORKSPACE/logs/scaffold.log"
-mkdir -p "$WORKSPACE/logs"
-: >"$LOG"
-# If empty workspace -> scaffold CRA via npx (avoid deprecated flags)
-if [ ! -f package.json ] && [ -z "$(ls -A . 2>/dev/null)" ]; then
-  if command -v npx >/dev/null 2>&1; then
-    if ! npx create-react-app@latest . --use-npm --silent >"$LOG" 2>&1; then
-      if command -v create-react-app >/dev/null 2>&1; then
-        create-react-app . --use-npm >"$LOG" 2>&1 || { echo "create-react-app failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 7; }
-      else
-        echo "create-react-app failed and no global create-react-app available; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 7
-      fi
-    fi
-  else
-    if command -v create-react-app >/dev/null 2>&1; then
-      create-react-app . --use-npm >"$LOG" 2>&1 || { echo "create-react-app failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 7; }
-    else
-      echo "npx and create-react-app not available; cannot scaffold" >&2; exit 8
-    fi
-  fi
-  echo "CRA" > "$WORKSPACE/logs/toolchain.txt"
-  echo "REACT_APP_API_URL=http://localhost:3001/api" > "$WORKSPACE/.env.local"
-  exit 0
+# If already CRA-like, skip
+if [ -f package.json ] && ( [ -f src/index.js ] || [ -f src/index.jsx ] || [ -f public/index.html ] ); then exit 0; fi
+if [ -f package.json ] && ! ( [ -f src/index.js ] || [ -f public/index.html ] ); then echo "package.json exists but no CRA structure; skipping scaffold to avoid overwrite" >&2; exit 6; fi
+# Prefer global modern create-react-app if available
+USE_NPX=1
+if command -v create-react-app >/dev/null 2>&1; then
+  CRA_V=$(create-react-app --version 2>/dev/null || echo "0")
+  CRA_MAJOR=$(echo "$CRA_V" | cut -d. -f1 || echo 0)
+  if [ "$CRA_MAJOR" -ge 5 ]; then USE_NPX=0; fi
 fi
-# If package.json exists, detect toolchain safely
-if [ -f package.json ]; then
-  TOOLCHAIN=$(node -e 'try{const j=require("./package.json");const deps=Object.assign({},j.dependencies||{},j.devDependencies||{});if(deps["react-scripts"])console.log("CRA");else if(deps["next"])console.log("NEXT");else if(deps["vite"])console.log("VITE");else if(deps["pnpm"])console.log("PNPM");else console.log("OTHER");}catch(e){console.error(e.message);process.exit(0)}' 2>>"$LOG" || echo "OTHER")
-  echo "$TOOLCHAIN" > "$WORKSPACE/logs/toolchain.txt"
-  # restore node_modules using lockfile if missing
-  if [ ! -d node_modules ]; then
-    if [ -f package-lock.json ]; then
-      npm ci --prefer-offline --no-audit --no-fund >"$LOG" 2>&1 || { echo "npm ci failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 9; }
-    elif [ -f yarn.lock ]; then
-      yarn install --silent >"$LOG" 2>&1 || { echo "yarn install failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 10; }
-    elif [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then
-      pnpm install --silent >"$LOG" 2>&1 || { echo "pnpm install failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 11; }
-    else
-      echo "No lockfile found; running npm install (non-deterministic)" >>"$LOG"
-      npm i --no-audit --no-fund >"$LOG" 2>&1 || { echo "npm install failed; see $LOG" >&2; tail -n 200 "$LOG" >&2; exit 12; }
-    fi
-  fi
-  # If toolchain is non-CRA, exit with log so later steps can adapt
-  if [ "$(cat "$WORKSPACE/logs/toolchain.txt")" != "CRA" ]; then
-    echo "Non-CRA toolchain detected: $(cat "$WORKSPACE/logs/toolchain.txt")" >>"$LOG"
-    exit 0
-  fi
+# Workaround for npm project name restrictions: pass --template and set temporary name in package.json after scaffolding
+TMPLOG=/tmp/cra_out.log
+# Use npx create-react-app in current dir non-interactively but supply a safe CLI name using --template and --skip-install when necessary
+# create-react-app rejects uppercase folder names; detect and run with an explicit project name then move files into place
+PROJ_NAME_SAFE=$(basename "$WORKSPACE" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')
+if [ -z "$PROJ_NAME_SAFE" ]; then PROJ_NAME_SAFE="app"; fi
+# If the safe name equals current folder name, we still must avoid uppercase; if name had uppercase letters, use proj_name_safe as explicit name in a temp dir
+if [ "$PROJ_NAME_SAFE" = "$(basename \"$WORKSPACE\")" ] && echo "$(basename \"$WORKSPACE\")" | grep '[A-Z]' >/dev/null 2>&1; then
+  PROJ_NAME_SAFE="$(basename \"$WORKSPACE\")" | tr '[:upper:]' '[:lower:]'
 fi
-# If reach here nothing to do
+TMPDIR=$(mktemp -d)
+cleanup() { rm -rf "$TMPDIR"; }
+trap cleanup EXIT
+if [ "$USE_NPX" -eq 1 ]; then
+  # create into temp dir with safe name to avoid naming restriction
+  (cd "$TMPDIR" && npx --yes create-react-app@latest "$PROJ_NAME_SAFE" --use-npm >"$TMPLOG" 2>&1) || { sed -n '1,200p' "$TMPLOG" >&2; exit 7; }
+else
+  (cd "$TMPDIR" && create-react-app "$PROJ_NAME_SAFE" --use-npm >"$TMPLOG" 2>&1) || { sed -n '1,200p' "$TMPLOG" >&2; exit 8; }
+fi
+# Move generated project contents into the workspace without changing file modes or creating helper executables
+SRCDIR="$TMPDIR/$PROJ_NAME_SAFE"
+if [ ! -d "$SRCDIR" ]; then echo "scaffold failed: expected output missing" >&2; sed -n '1,200p' "$TMPLOG" >&2; exit 9; fi
+# Copy files into workspace, but do not overwrite existing files (idempotent)
+shopt -s dotglob
+for f in "$SRCDIR"/*; do
+  bn=$(basename "$f")
+  if [ -e "$WORKSPACE/$bn" ]; then continue; fi
+  mv "$f" "$WORKSPACE/"
+done
+# Add ImageUpload and App only if absent
+if [ ! -d src ]; then mkdir -p src; fi
+if [ ! -f src/ImageUpload.js ]; then
+  cat > src/ImageUpload.js <<'JS'
+import React, {useState} from 'react';
+export default function ImageUpload(){
+  const [src,setSrc]=useState(null);
+  return (
+    <div>
+      <input data-testid="file" type="file" accept="image/*" onChange={e=>{const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>setSrc(ev.target.result); r.readAsDataURL(f);}} />
+      {src && <img src={src} alt="preview" style={{maxWidth:300}} />}
+    </div>
+  );
+}
+JS
+fi
+if [ ! -f src/App.js ]; then
+  cat > src/App.js <<'JS'
+import React from 'react';
+import ImageUpload from './ImageUpload';
+export default function App(){ return (<div><h1>Recipe Finder (dev scaffold)</h1><ImageUpload/></div>); }
+JS
+fi
+if [ ! -f .env.example ]; then
+  cat > .env.example <<'ENV'
+# REACT_APP_API_URL=http://localhost:3001
+ENV
+fi
 exit 0
